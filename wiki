@@ -1,0 +1,156 @@
+#!/usr/bin/env ruby
+
+require 'bundler/inline'
+
+gemfile do
+  source 'https://rubygems.org'
+  gem 'json'
+  gem 'pry'
+  gem 'typhoeus'
+end
+
+@url = 'https://wiki.domain.tld'
+@api_key = 'ey....'
+@folder_map={root: 0, inventory: 111}
+
+create_page_query = "mutation ($content: String!, $description: String!, $editor: String!, $isPrivate: Boolean!, $isPublished: Boolean!, $locale: String!, $path: String!, $publishEndDate: Date, $publishStartDate: Date, $scriptCss: String, $scriptJs: String, $tags: [String]!, $title: String!) {\n  pages {\n    create(content: $content, description: $description, editor: $editor, isPrivate: $isPrivate, isPublished: $isPublished, locale: $locale, path: $path, publishEndDate: $publishEndDate, publishStartDate: $publishStartDate, scriptCss: $scriptCss, scriptJs: $scriptJs, tags: $tags, title: $title) {\n      responseResult {\n        succeeded\n        errorCode\n        slug\n        message\n        __typename\n      }\n      page {\n        id\n        updatedAt\n        __typename\n      }\n      __typename\n    }\n    __typename\n  }\n}\n"
+create_asset_folder_query = "mutation ($parentFolderId: Int!, $slug: String!) {  assets {    createFolder(parentFolderId: $parentFolderId, slug: $slug) {      responseResult {        succeeded        errorCode        slug        message        __typename      }      __typename    }    __typename  }}"
+list_asset_folders_query = "query ($parentFolderId: Int!) {  assets {    folders(parentFolderId: $parentFolderId) {      id      name      slug      __typename    }    __typename  }}"
+replace_page_query = "mutation ($id: Int!, $content: String, $description: String, $editor: String, $isPrivate: Boolean, $isPublished: Boolean, $locale: String, $path: String, $publishEndDate: Date, $publishStartDate: Date, $scriptCss: String, $scriptJs: String, $tags: [String], $title: String) {\n  pages {\n    update(id: $id, content: $content, description: $description, editor: $editor, isPrivate: $isPrivate, isPublished: $isPublished, locale: $locale, path: $path, publishEndDate: $publishEndDate, publishStartDate: $publishStartDate, scriptCss: $scriptCss, scriptJs: $scriptJs, tags: $tags, title: $title) {\n      responseResult {\n        succeeded\n        errorCode\n        slug\n        message\n        __typename\n      }\n      page {\n        updatedAt\n        __typename\n      }\n      __typename\n    }\n    __typename\n  }\n}\n"
+list_asset_files_query = "query ($folderId: Int!, $kind: AssetKind!) {\n  assets {\n    list(folderId: $folderId, kind: $kind) {\n      id\n      filename\n      ext\n      kind\n      mime\n      fileSize\n      createdAt\n      updatedAt\n      __typename\n    }\n    __typename\n  }\n}\n"
+
+# Hack to allow duplicate param names in multipart form data
+Ethon::Easy::Queryable.module_eval do
+  def recursively_generate_pairs(h, prefix, pairs)
+    encode_hash_pairs(h, prefix, pairs)
+  end
+
+  def encode_hash_pairs(h, prefix, pairs)
+    h.each do |k,v|
+      key = prefix.nil? ? k : "#{prefix}[#{k}]"
+      pairs_for(v, key, pairs)
+    end
+  end
+end
+# End of hack
+
+def request_data(query:, variables:)
+  {
+    operationName: nil,
+    variables: variables,
+    extensions: {},
+    query: query
+  }
+end
+
+def perform_request(query:, variables:)
+  Typhoeus.post(
+    "#{@url}/graphql",
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': "Bearer #{@api_key}"
+    },
+    body: JSON.generate([
+      {
+        operationName: nil,
+        variables: variables,
+        extensions: {},
+        query: query
+      }
+    ])
+  )
+end
+
+def upload_asset(path:, folder_id:)
+  Typhoeus.post(
+    "#{@url}/u",
+    headers: {
+      'Authorization': "Bearer #{@api_key}"
+    },
+    body: [
+      [:mediaUpload, JSON.generate({ folderId: folder_id })],
+      [:mediaUpload, File.open(path)]
+    ]
+  )
+end
+
+#===============================================================================
+
+
+
+cmd = ARGV.shift
+
+case cmd
+when 'mkdir'
+folder_name = ARGV.shift
+folder_id = @folder_map[folder_name.to_sym]
+  folder_data = {
+    parentFolderId: folder_id,
+    slug: ARGV.shift
+  }
+  response = perform_request(query: create_asset_folder_query, variables: folder_data)
+  pp JSON.parse(response.body)
+when 'upload'
+folder_name = ARGV.shift
+folder_id = @folder_map[folder_name.to_sym]
+  subfolder_name = ARGV.shift
+  response = perform_request(query: list_asset_folders_query, variables: { parentFolderId: folder_id })
+  folders = JSON.parse(response.body).dig(0, 'data', 'assets', 'folders')
+  folder_id = folders.find { |f| f['slug'] == subfolder_name }.fetch('id') do
+    raise "Could not find folder #{subfolder_name}"
+  end
+  file_name = ARGV.shift
+  response = upload_asset(path: file_name, folder_id: folder_id)
+  pp response.body
+when 'folder_list'
+folder_name = ARGV.shift
+folder_id = @folder_map[folder_name.to_sym]
+  response = perform_request(query: list_asset_folders_query, variables: { parentFolderId: folder_id })
+  folders = JSON.parse(response.body).dig(0, 'data', 'assets', 'folders')
+  pp folders
+when 'files_list'
+  folder_name = ARGV.shift
+  folder_id = @folder_map[folder_name.to_sym]
+  response = perform_request(query: list_asset_files_query, variables: { folderId: folder_id, kind: 'ALL' })
+  files = JSON.parse(response.body).dig(0,'data', 'assets', 'list').map{|i| i['filename'] }
+  puts files.to_json
+when 'add_page'
+  page_data = {
+  'path': ARGV.shift,
+  'title': ARGV.shift,
+  'content': File.read(ARGV.shift),
+  'description': '',
+  'editor': 'markdown',
+  'locale': 'en',
+  'isPrivate': false,
+  'isPublished': true,
+  'publishEndDate': '',
+  'publishStartDate': '',
+  'scriptCss': '',
+  'scriptJs': '',
+  'tags': [],
+  }
+  response = perform_request(query: create_page_query, variables: page_data)
+  pp JSON.parse(response.body)
+when 'replace_page'
+  page_data = {
+  'id': ARGV.shift.to_i,
+  'content': File.read(ARGV.shift),
+  'description': '',
+  'editor': 'markdown',
+  'locale': 'en',
+  'isPrivate': false,
+  'isPublished': true,
+  'publishEndDate': '',
+  'publishStartDate': '',
+  'scriptCss': '',
+  'scriptJs': '',
+  'tags': [],
+  }
+  response = perform_request(query: replace_page_query, variables: page_data)
+  pp JSON.parse(response.body)
+else 
+  puts "usage: wiki action arguments"
+  puts "where action is one of mkdir upload folder_list files_list add_page replace_page"
+  puts "before first use set base url, token and at least root folder id in folder map"
+end
